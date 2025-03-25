@@ -2,3 +2,5 @@ fastapi
 openapi
 uvicorn
 pinecone
+neo4j
+python-dotenv
