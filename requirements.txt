@@ -1,0 +1,4 @@
+fastapi
+openapi
+uvicorn
+pinecone
