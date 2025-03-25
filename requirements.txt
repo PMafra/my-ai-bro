@@ -4,3 +4,5 @@ uvicorn
 pinecone
 neo4j
 python-dotenv
+spacy
+#en-core-web-sm
