@@ -63,6 +63,36 @@ except OSError:
 app = FastAPI(title="Vector DB Enhanced AI Chatbot", lifespan=lifespan)
 
 
+def get_session_entities(tx, session_id: str):
+    """
+    Return all entities mentioned by a given session.
+    """
+    query = """
+    MATCH (s:Session {id: $session_id})-[:MENTIONED]->(e:Entity)
+    RETURN e.name AS entity_name, e.type AS entity_type
+    """
+    result = tx.run(query, session_id=session_id)
+    return result.data()
+
+
+def retrieve_relevant_facts(session_id: str) -> List[str]:
+    """
+    Query Neo4j for facts/relationships that might be relevant
+    to the user's session. Then return them as text strings.
+    """
+    with driver.session() as neo_session:
+        records = neo_session.execute_read(get_session_entities, session_id)
+    # Convert the returned graph data into a list of textual statements
+    facts = []
+    for r in records:
+        entity_name = r["entity_name"]
+        entity_type = r["entity_type"]
+        # Example text. In real usage, you might store more properties
+        fact_text = f"Session {session_id} mentioned a {entity_type} named {entity_name}."
+        facts.append(fact_text)
+    return facts
+
+
 def parse_relationships(text: str) -> dict:
     """
     Very naive, rule-based extraction of user, father, dog.
@@ -98,94 +128,117 @@ def parse_relationships(text: str) -> dict:
     return rel_data
 
 
-def extract_entities_spacy(text: str) -> List[dict]:
+def store_family_relationships(rel_data: dict):
     """
-    Use SpaCy to parse `text` and return a list of entities with their label/type.
-    Return format:
-        [{"entity": "Alice", "type": "PERSON"},
-         {"entity": "New York", "type": "GPE"}, ...]
+    Create a (Person {name: user_name}) node if missing.
+    If father_name is present, create (father:Person {name: father_name}) node
+      and (user)-[:HAS_FATHER]->(father).
+    If dog_name is present, create (dog:Dog {name: dog_name}) node
+      and (user)-[:HAS_DOG]->(dog).
+    """
+    user = rel_data.get("user_name")
+    father = rel_data.get("father_name")
+    dog = rel_data.get("dog_name")
+
+    if not user and not father and not dog:
+        return  # nothing to store
+
+    with driver.session() as session:
+        session.execute_write(_store_rel_tx, user, father, dog)
+
+
+def _store_rel_tx(tx, user_name, father_name, dog_name):
+    """
+    Build a Cypher query dynamically depending on what's present.
+    This approach MERGEs the nodes/relationships so we don't create duplicates.
+    """
+    # We'll do MERGE statements for each relationship found.
+    # We separate them for clarity, though you could chain them in one big query.
+    if user_name:
+        # Merge user as a Person node
+        tx.run("""
+            MERGE (u:Person {name: $user_name})
+        """, user_name=user_name)
+
+    if father_name and user_name:
+        tx.run("""
+            MERGE (u:Person {name: $user_name})
+            MERGE (f:Person {name: $father_name})
+            MERGE (u)-[:HAS_FATHER]->(f)
+        """, user_name=user_name, father_name=father_name)
+
+    if dog_name and user_name:
+        tx.run("""
+            MERGE (u:Person {name: $user_name})
+            MERGE (d:Dog {name: $dog_name})
+            MERGE (u)-[:HAS_DOG]->(d)
+        """, user_name=user_name, dog_name=dog_name)
+
+
+# --------------------------
+#   NER (for other mentions)
+# --------------------------
+def extract_spacy_entities(text: str):
+    """
+    We'll still do a general SpaCy NER pass, in case we want
+    to store other mentions that don't fit father/dog patterns.
+    Return a list of {entity, type}.
     """
     doc = nlp(text)
-    entities = []
+    ents = []
     for ent in doc.ents:
-        entities.append({"entity": ent.text, "type": ent.label_})
-    return entities
+        ents.append({"entity": ent.text, "type": ent.label_})
+    return ents
 
+def store_generic_mentions(session_id: str, entities: List[dict]):
+    """
+    If we want to store leftover mentions, we can keep the old approach
+    (Session)-[:MENTIONED]->(Entity).
+    We'll skip father/dog from here to avoid duplicating them.
+    """
+    with driver.session() as neo_session:
+        for ent in entities:
+            name = ent["entity"]
+            e_type = ent["type"]
+            # We skip father/dog logic because it's handled above
+            # But let's keep everything else
+            neo_session.execute_write(_store_mention, session_id, name, e_type)
 
-def create_entity_node(tx, session_id: str, entity_info: dict):
-    """
-    Write transaction for Neo4j. Creates (Entity) node and
-    (Session)-[:MENTIONED]->(Entity) relationship, for example.
-    """
+def _store_mention(tx, session_id, entity_name, entity_type):
     query = """
     MERGE (s:Session {id: $session_id})
     MERGE (e:Entity {name: $entity_name, type: $entity_type})
     MERGE (s)-[:MENTIONED]->(e)
     """
-    tx.run(query, 
+    tx.run(query,
         session_id=session_id,
-        entity_name=entity_info["entity"],
-        entity_type=entity_info["type"]
+        entity_name=entity_name,
+        entity_type=entity_type
     )
-
-
-def store_entities_in_neo4j(session_id: str, entities: List[dict]):
-    """
-    For each entity, create a node in Neo4j (if it doesn't exist),
-    then link the session to the entity with a MENTIONED relationship.
-    """
-    if not entities:
-        return
-    with driver.session() as neo_session:
-        for ent in entities:
-            neo_session.execute_write(create_entity_node, session_id, ent)
-
-
-def get_session_entities(tx, session_id: str):
-    """
-    Return all entities mentioned by a given session.
-    """
-    query = """
-    MATCH (s:Session {id: $session_id})-[:MENTIONED]->(e:Entity)
-    RETURN e.name AS entity_name, e.type AS entity_type
-    """
-    result = tx.run(query, session_id=session_id)
-    return result.data()
-
-
-def retrieve_relevant_facts(session_id: str) -> List[str]:
-    """
-    Query Neo4j for facts/relationships that might be relevant
-    to the user's session. Then return them as text strings.
-    """
-    with driver.session() as neo_session:
-        records = neo_session.execute_read(get_session_entities, session_id)
-    # Convert the returned graph data into a list of textual statements
-    facts = []
-    for r in records:
-        entity_name = r["entity_name"]
-        entity_type = r["entity_type"]
-        # Example text. In real usage, you might store more properties
-        fact_text = f"Session {session_id} mentioned a {entity_type} named {entity_name}."
-        facts.append(fact_text)
-    return facts
 
 
 @app.post("/chat-vector")
 def chat_endpoint(user_message: UserMessage):
-    """
-    Endpoint to receive a user's message, store context, 
-    retrieve relevant data from Pinecone, and return an AI-generated response.
-    """
-    session_id = user_message.session_id
+    session_id = user_message.session_id.strip()
     user_text = user_message.message.strip()
 
-    if session_id not in conversation_history:
-        conversation_history[session_id] = []
-    conversation_history[session_id].append(f"User: {user_text}")
+    # 1) Maintain local conversation
+    conversation_history.setdefault(session_id, []).append(f"User: {user_text}")
 
-    entities = extract_entities_spacy(user_text)
-    store_entities_in_neo4j(session_id, entities)
+    # 2) Parse father/dog relationships from the text
+    rel_data = parse_relationships(user_text)
+    store_family_relationships(rel_data)
+
+    # 3) Use SpaCy NER to store other mentions
+    all_entities = extract_spacy_entities(user_text)
+    # We'll filter out father/dog references by name if we want to avoid duplicates:
+    leftover_ents = []
+    for ent in all_entities:
+        # If it's the father_name or dog_name, skip. 
+        # If it's the user_name, skip as well. 
+        if ent["entity"] not in (rel_data["user_name"], rel_data["father_name"], rel_data["dog_name"]):
+            leftover_ents.append(ent)
+    store_generic_mentions(session_id, leftover_ents)
 
     try:
         embedding_response = openai.embeddings.create(
@@ -234,6 +287,7 @@ def chat_endpoint(user_message: UserMessage):
 
     try:
         facts = retrieve_relevant_facts(session_id)
+        print("facts", facts)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving facts from Neo4j: {str(e)}")
 
@@ -250,8 +304,8 @@ def chat_endpoint(user_message: UserMessage):
         }
     ]
 
-    for msg in relevant_messages:
-        messages.append(msg)
+    # for msg in relevant_messages:
+    #     messages.append(msg)
 
     messages.append({"role": "user", "content": user_text})
 
