@@ -6,6 +6,8 @@ from neo4j import GraphDatabase, basic_auth
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
+import json
+from fastapi.responses import StreamingResponse
 
 load_dotenv()
 
@@ -79,56 +81,127 @@ Response (JSON):
     except json.JSONDecodeError:
         raise ValueError(f"LLM did not return valid JSON:\n{response_text}")
 
+def sse_stream_llm_answer(prompt: str, query_data: List[dict]):
+    """
+    We'll feed 'query_data' to GPT in streaming mode to produce
+    a user-friendly answer. 
+    """
+    # Convert data to a string the model can read
+    data_str = json.dumps(query_data, indent=2)
 
-@app.post("/chat-dynamic-graph")
-def chat_dynamic_graph(user_query: UserQuery):
-    user_text = user_query.message.strip()
+    # Build a system + user prompt
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant. Summarize the query results for the user."},
+        {
+            "role": "user",
+            "content": (
+                f"User's original prompt: {prompt}\n"
+                f"Query results:\n{data_str}\n"
+                "Please provide a concise answer."
+            )
+        }
+    ]
 
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.7,
+        stream=True
+    )
+
+    for chunk in response:
+        if not chunk.choices:
+            continue
+
+        delta = chunk.choices[0].delta
+        content = delta.content
+        if content:
+            yield f"data: {content}\n\n"
+
+@app.get("/chat-dynamic-graph-sse")
+def chat_dynamic_graph_sse(session_id: str, message: str):
     try:
-        llm_output = translate_to_cypher(user_text)  
-    except ValueError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        output = translate_to_cypher(message)
+    except Exception as e:
+        def error_gen():
+            yield f"data: [ERROR parsing LLM output]: {str(e)}\n\n"
+        return StreamingResponse(error_gen(), media_type="text/event-stream")
 
-    action = llm_output.get("action")
-    cypher = llm_output.get("cypher")
+    action = output.get("action")
+    cypher = output.get("cypher")
 
     if not action or not cypher:
-        raise HTTPException(status_code=500, detail="LLM output is missing required fields.")
+        def error_gen():
+            yield "data: [ERROR] Missing 'action' or 'cypher'.\n\n"
+        return StreamingResponse(error_gen(), media_type="text/event-stream")
 
-    try:
-        with driver.session() as session:
-            if action in ["create", "update"]:
+    with driver.session() as session:
+        if action in ["create", "update"]:
+            try:
                 session.run(cypher)
-                return {"result": f"Successfully executed {action} query.", "cypher": cypher}
-            elif action == "query":
+                def success_stream():
+                    yield f"data: Successfully executed {action} query.\n\n"
+                return StreamingResponse(success_stream(), media_type="text/event-stream")
+            except Exception as e:
+                def error_gen():
+                    yield f"data: [ERROR executing {action}]: {str(e)}\n\n"
+                return StreamingResponse(error_gen(), media_type="text/event-stream")
+
+        elif action == "query":
+            try:
                 result = session.run(cypher)
                 records = list(result)
-                data = []
-                for r in records:
-                    data.append(dict(r))
-                answer = summarize_query_results(user_text, data)
-                return {"result": answer, "data": data, "cypher": cypher}
-            else:
-                return {"result": f"Unknown action: {action}", "cypher": cypher}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cypher execution failed: {str(e)}")
+                data = [record_to_dict(r) for r in records]  # <--- FIX
+                print("##########", data)
+            except Exception as e:
+                def error_gen():
+                    yield f"data: [ERROR running query]: {str(e)}\n\n"
+                return StreamingResponse(error_gen(), media_type="text/event-stream")
 
-def summarize_query_results(user_text: str, query_results: List[dict]) -> str:
+            return StreamingResponse(
+                sse_stream_llm_answer(message, data),
+                media_type="text/event-stream"
+            )
+        else:
+            def unknown_gen():
+                yield f"data: [WARNING] Unknown action '{action}'. Attempting to run Cypher...\n\n"
+                try:
+                    session.run(cypher)
+                    yield f"data: Cypher executed successfully.\n\n"
+                except Exception as e2:
+                    yield f"data: [ERROR running Cypher]: {str(e2)}\n\n"
+            return StreamingResponse(unknown_gen(), media_type="text/event-stream")
+        
+from neo4j.graph import Node, Relationship
+
+def neo4j_value_to_dict(value):
     """
-    Optionally feed the results back to the LLM to generate a human-friendly answer.
-    For brevity, we do a direct string formatting here.
+    Convert a Neo4j Node/Relationship to a dict,
+    or pass through basic types (str, int, float, etc.).
     """
-    if not query_results:
-        return "No data found."
+    if isinstance(value, Node):
+        return {
+            "id": value.element_id,
+            "labels": list(value.labels),
+            "properties": dict(value)
+        }
+    elif isinstance(value, Relationship):
+        return {
+            "id": value.element_id,
+            "type": value.type,
+            "start_id": value.start_node.element_id,
+            "end_id": value.end_node.element_id,
+            "properties": dict(value)
+        }
     else:
-        result_str = str(query_results)
-        summary_prompt = f"User asked: '{user_text}'\nData: {result_str}\nPlease summarize the above data in a short answer."
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant for summarizing query results."},
-                {"role": "user", "content": summary_prompt}
-            ],
-            temperature=0.2,
-        )
-        return completion.choices[0].message.content.strip()
+        return value
+
+def record_to_dict(record):
+    """
+    Convert an entire record (which may have multiple keys)
+    into a JSON-friendly dict.
+    """
+    d = {}
+    for key, val in record.items():
+        d[key] = neo4j_value_to_dict(val)
+    return d

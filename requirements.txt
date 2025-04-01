@@ -7,3 +7,4 @@ python-dotenv
 spacy
 #en-core-web-sm
 streamlit
+requests
