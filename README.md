@@ -22,6 +22,6 @@
    ```
 5. Initialize Streamlit app:
    ```
-   streamlit run streamlit_app.py
+   streamlit run streamlit_app_sse.py
    ```
 6. Enter http://localhost:8501/ to test the app
